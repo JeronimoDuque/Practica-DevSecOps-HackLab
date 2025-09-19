@@ -16,3 +16,78 @@ jobs:
       - name: Semgrep
         run: |
           docker run --rm -v "$PWD:/src" returntocorp/semgrep:latest             semgrep scan --error --config p/ci --config .semgrep
+  iac:
+    runs-on: self-hosted
+    needs: [sast]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          soft_fail: false
+
+  build:
+    runs-on: self-hosted
+    needs: [iac]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build imagen
+        run: |
+          cd apps/00-safe-baseline
+          docker build -t demo-app:local .
+      - name: SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: demo-app:local
+          artifact-name: sbom.spdx.json
+  container_scan:
+    runs-on: self-hosted
+    needs: [build]
+    steps:
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: demo-app:local
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+      - uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: trivy-image.sarif }
+
+  sign:
+    runs-on: self-hosted
+    needs: [container_scan]
+    steps:
+      - name: Instalar cosign
+        run: |
+          COSIGN_URL="https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64"
+          curl -sSLf "$COSIGN_URL" -o /usr/local/bin/cosign
+          chmod +x /usr/local/bin/cosign
+      - name: Generar claves si no existen
+        run: cosign generate-key-pair || true
+      - name: Firmar imagen
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: cosign sign --key cosign.key demo-app:local <<< "$COSIGN_PASSWORD"
+  deploy:
+    runs-on: self-hosted
+    needs: [sign]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargar imagen al clúster (kind)
+        run: kind load docker-image demo-app:local --name devsecops
+      - name: Deploy (Helm)
+        run: |
+          helm upgrade --install demo charts/demo-app             --set image.repository=demo-app             --set image.tag=local --set service.type=NodePort
+      - name: Esperar readiness
+        run: kubectl rollout status deploy/demo-app --timeout=120s
+
+  dast:
+    runs-on: self-hosted
+    needs: [deploy]
+    steps:
+      - name: Port-forward & ZAP baseline
+        run: |
+          kubectl port-forward svc/demo-app 8080:80 & echo $! > pf.pid; sleep 3
+          docker run --rm -t owasp/zap2docker-stable zap-baseline.py -t http://localhost:8080 -x zap.xml
+          kill $(cat pf.pid) || true
